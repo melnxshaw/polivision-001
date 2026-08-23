@@ -24,10 +24,9 @@ PALETTE = {
     "amber": "#F5A623", "amber_deep": "#D4780C", "cream": "#FFE7BD",
     "text": "#FBF3E7", "text_dim": "#B8A88F",
     "good": "#7BC67E", "bad": "#E2685A",
-    "saffron": "#FF9933", "flag_white": "#FAF6EC", "flag_green": "#128807",
 }
-# Brand gradient — tricolor accent for the Polivision wordmark & key CTAs only
-BRAND_GRADIENT = f"linear-gradient(100deg, {PALETTE['saffron']} 0%, {PALETTE['flag_white']} 50%, {PALETTE['flag_green']} 100%)"
+# Brand gradient — vibrant multi-color accent for the Polivision wordmark & key CTAs
+BRAND_GRADIENT = "linear-gradient(100deg, #6366F1 0%, #06B6D4 30%, #22C55E 55%, #F59E0B 78%, #EC4899 100%)"
 # Working gradient for dashboard chrome (buttons, tab underline) — same family, less stripe-like
 GRADIENT_MAIN = f"linear-gradient(120deg, {PALETTE['amber_deep']} 0%, {PALETTE['amber']} 55%, {PALETTE['cream']} 100%)"
 PLOTLY_COLORWAY = [PALETTE["amber"], "#E2685A", "#7BC67E", "#D4780C",
@@ -484,16 +483,25 @@ def render_dashboard_page():
         fig5.add_trace(go.Scatter(x=future_dates, y=fc["Forecast_HoltWinters"],
                                    mode="lines", name="Forecast (Holt-Winters)",
                                    line=dict(color=PALETTE["good"], dash="dot", width=2)))
+        fig5.add_trace(go.Scatter(x=future_dates, y=fc["Forecast_XGBoost"],
+                                   mode="lines", name="Forecast (XGBoost)",
+                                   line=dict(color="#6366F1", dash="dashdot", width=2)))
+        fig5.add_trace(go.Scatter(x=future_dates, y=fc["Forecast_Prophet"],
+                                   mode="lines", name="Forecast (Prophet)",
+                                   line=dict(color="#EC4899", dash="longdash", width=2)))
         fig5.add_trace(go.Scatter(
             x=list(future_dates) + list(future_dates[::-1]),
             y=list(fc["Upper_80"]) + list(fc["Lower_80"][::-1]),
             fill="toself", fillcolor="rgba(245,166,35,0.14)", line=dict(width=0),
-            name="80% Confidence Interval", showlegend=True))
+            name="80% Confidence Interval (SARIMA)", showlegend=True))
         st.plotly_chart(style_fig(fig5, 460), use_container_width=True)
+        st.caption("SARIMA carries the shaded 80% confidence band; the other models are shown "
+                   "as point forecasts for comparison.")
 
         st.dataframe(fc.style.format({
             "Forecast_SARIMA": "{:,.0f}", "Lower_80": "{:,.0f}", "Upper_80": "{:,.0f}",
-            "Forecast_HoltWinters": "{:,.0f}"}), use_container_width=True)
+            "Forecast_HoltWinters": "{:,.0f}", "Forecast_XGBoost": "{:,.0f}",
+            "Forecast_Prophet": "{:,.0f}"}), use_container_width=True)
 
         csv = fc.to_csv(index=False).encode()
         st.download_button("⬇️ Download forecast as CSV", csv, "nbp_forecast.csv", "text/csv")
@@ -562,6 +570,11 @@ def render_dashboard_page():
         with st.expander("Can I add newer months myself?"):
             st.markdown("""Yes — upload raw council `.xls` files or CSVs in the sidebar any time;
             they merge with the built-in dataset and deduplicate automatically.""")
+        with st.expander("Why do the model lists include both statistical and ML models?"):
+            st.markdown("""The backtest compares classical statistical models (Naive, Seasonal Naive,
+            Moving Average, Holt-Winters, SARIMA) against machine-learning approaches (XGBoost on
+            lag/rolling features, Prophet) side by side on the same rolling-origin folds — so the
+            choice of "which kind of model wins" is decided by evidence, not assumption.""")
         with st.expander("What are the known limitations?"):
             st.markdown("""Forecasts assume the recent trend/seasonality broadly continues — they do
             not anticipate regulatory changes, new product launches, or macro shocks. Forecasts are
