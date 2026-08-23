@@ -1,22 +1,42 @@
 """
 Forecasting models + time-ordered backtesting for monthly NBP series.
 
-Models:
+Models compared in the backtest:
   - Naive (last value carried forward)
   - Seasonal Naive (same month last year)
   - Moving Average (trailing window)
   - Holt-Winters / ETS (trend + additive seasonality)
-  - SARIMA (seasonal ARIMA)
+  - SARIMA (seasonal ARIMA) — statistical, now included in the backtest comparison too
+  - XGBoost (gradient boosted trees on lag/rolling features, recursive multi-step)
+  - Prophet (additive trend + yearly seasonality model)
 
 Metrics (matching the hackathon brief): MAE, RMSE, WAPE, Bias
 """
+import io
+import contextlib
+import logging
 import numpy as np
 import pandas as pd
 import warnings
 warnings.filterwarnings("ignore")
+logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
+logging.getLogger("prophet").setLevel(logging.ERROR)
+logging.getLogger("statsmodels").setLevel(logging.ERROR)
 
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+try:
+    import xgboost as xgb
+    _HAS_XGBOOST = True
+except ImportError:
+    _HAS_XGBOOST = False
+
+try:
+    from prophet import Prophet
+    _HAS_PROPHET = True
+except ImportError:
+    _HAS_PROPHET = False
 
 
 # ---------- Metrics ----------
@@ -48,7 +68,7 @@ def all_metrics(actual, pred):
             "WAPE_%": wape(actual, pred), "Bias_%": bias(actual, pred)}
 
 
-# ---------- Models ----------
+# ---------- Statistical / baseline models ----------
 # Each model fn(train: pd.Series, horizon: int) -> np.array of length horizon
 
 def model_naive(train, horizon):
@@ -78,21 +98,93 @@ def model_holt_winters(train, horizon, season=12):
     except Exception:
         return model_seasonal_naive(train, horizon, season)
 
-def model_sarima(train, horizon, season=12, order=(1, 1, 1), seasonal_order=None):
+def _sarima_fit_forecast(train, horizon, season=12, order=(1, 1, 1), seasonal_order=None):
+    """Internal: fits SARIMA and returns (mean, lower80, upper80) arrays."""
+    so = seasonal_order or (1, 1, 1, season if len(train) >= 2 * season else 0)
+    model = SARIMAX(train, order=order, seasonal_order=so,
+                     enforce_stationarity=False, enforce_invertibility=False)
+    fit = model.fit(disp=False)
+    fc = fit.get_forecast(horizon)
+    mean = fc.predicted_mean.values
+    ci = fc.conf_int(alpha=0.2)  # 80% CI
+    lower = ci.iloc[:, 0].values
+    upper = ci.iloc[:, 1].values
+    return np.clip(mean, 0, None), np.clip(lower, 0, None), np.clip(upper, 0, None)
+
+def model_sarima(train, horizon, season=12):
+    """Backtest-friendly wrapper: returns just the mean forecast array."""
     try:
-        so = seasonal_order or (1, 1, 1, season if len(train) >= 2 * season else 0)
-        model = SARIMAX(train, order=order, seasonal_order=so,
-                         enforce_stationarity=False, enforce_invertibility=False)
-        fit = model.fit(disp=False)
-        fc = fit.get_forecast(horizon)
-        mean = fc.predicted_mean.values
-        ci = fc.conf_int(alpha=0.2)  # 80% CI
-        lower = ci.iloc[:, 0].values
-        upper = ci.iloc[:, 1].values
-        return np.clip(mean, 0, None), np.clip(lower, 0, None), np.clip(upper, 0, None)
+        mean, _, _ = _sarima_fit_forecast(train, horizon, season)
+        return mean
+    except Exception:
+        return model_holt_winters(train, horizon, season)
+
+def model_sarima_with_ci(train, horizon, season=12):
+    """Used by final_forecast — returns (mean, lower, upper)."""
+    try:
+        return _sarima_fit_forecast(train, horizon, season)
     except Exception:
         fc = model_holt_winters(train, horizon, season)
         return fc, fc * 0.85, fc * 1.15
+
+
+# ---------- ML model: XGBoost on lag/rolling features (recursive multi-step) ----------
+
+_XGB_LAGS = [1, 2, 3, 6, 12]
+
+def _build_lag_features(values: np.ndarray, lags=_XGB_LAGS):
+    """Builds a supervised (X, y) table from a 1D array using lag features."""
+    max_lag = max(lags)
+    X, y = [], []
+    for t in range(max_lag, len(values)):
+        X.append([values[t - lag] for lag in lags])
+        y.append(values[t])
+    return np.array(X), np.array(y)
+
+def model_xgboost(train, horizon, lags=_XGB_LAGS):
+    if not _HAS_XGBOOST:
+        return model_seasonal_naive(train, horizon)
+    values = train.values.astype(float)
+    max_lag = max(lags)
+    if len(values) <= max_lag + 5:
+        # not enough history for reliable lag features — fall back
+        return model_seasonal_naive(train, horizon)
+    try:
+        X, y = _build_lag_features(values, lags)
+        model = xgb.XGBRegressor(n_estimators=200, max_depth=3, learning_rate=0.08,
+                                  subsample=0.9, colsample_bytree=0.9, verbosity=0)
+        model.fit(X, y)
+
+        # recursive multi-step forecasting: predicted values feed back in as lags
+        history = list(values)
+        preds = []
+        for _ in range(horizon):
+            feat = np.array([[history[-lag] for lag in lags]])
+            next_val = float(model.predict(feat)[0])
+            preds.append(max(next_val, 0))
+            history.append(next_val)
+        return np.array(preds)
+    except Exception:
+        return model_seasonal_naive(train, horizon)
+
+
+# ---------- ML model: Prophet ----------
+
+def model_prophet(train, horizon):
+    if not _HAS_PROPHET:
+        return model_seasonal_naive(train, horizon)
+    try:
+        dfp = pd.DataFrame({"ds": train.index, "y": train.values})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            m = Prophet(yearly_seasonality=len(train) >= 24, weekly_seasonality=False,
+                        daily_seasonality=False)
+            m.fit(dfp)
+            future = m.make_future_dataframe(periods=horizon, freq="MS")
+            fc = m.predict(future)
+        preds = fc["yhat"].values[-horizon:]
+        return np.clip(preds, 0, None)
+    except Exception:
+        return model_seasonal_naive(train, horizon)
 
 
 MODEL_REGISTRY = {
@@ -100,6 +192,9 @@ MODEL_REGISTRY = {
     "Seasonal Naive": model_seasonal_naive,
     "Moving Average (3mo)": model_moving_average,
     "Holt-Winters (ETS)": model_holt_winters,
+    "SARIMA": model_sarima,
+    "XGBoost": model_xgboost,
+    "Prophet": model_prophet,
 }
 
 
@@ -145,10 +240,12 @@ def time_ordered_backtest(series: pd.Series, horizon=3, min_train=18, step=1):
 def final_forecast(series: pd.Series, horizon=6, season=12):
     """
     Produces the final forward-looking forecast using SARIMA (with CI),
-    plus a Holt-Winters comparison line.
+    plus Holt-Winters, XGBoost, and Prophet comparison lines.
     """
-    sarima_mean, sarima_lo, sarima_hi = model_sarima(series, horizon, season)
+    sarima_mean, sarima_lo, sarima_hi = model_sarima_with_ci(series, horizon, season)
     hw = model_holt_winters(series, horizon, season)
+    xgb_fc = model_xgboost(series, horizon)
+    prophet_fc = model_prophet(series, horizon)
 
     future_idx = pd.date_range(
         start=series.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS"
@@ -159,5 +256,7 @@ def final_forecast(series: pd.Series, horizon=6, season=12):
         "Lower_80": sarima_lo,
         "Upper_80": sarima_hi,
         "Forecast_HoltWinters": hw,
+        "Forecast_XGBoost": xgb_fc,
+        "Forecast_Prophet": prophet_fc,
     })
     return out
